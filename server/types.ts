@@ -1,0 +1,3 @@
+export type TxType="Income"|"Expense"|"Savings"|"Loan Payment"|"Investment"|"Transfer"|"Other";
+export interface Transaction{ id:string; date:string; type:TxType; category:string; description:string; account:string; paymentMethod:string; amount:number; notes:string; }
+export interface FinanceSummary{ income:number; expenses:number; savings:number; investments:number; loanPayments:number; netCashFlow:number; savingsRate:number; }
