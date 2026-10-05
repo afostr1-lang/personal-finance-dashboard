@@ -1,40 +1,7 @@
-import express from "express";
-import cors from "cors";
-import path from "node:path";
-import { addTransaction, file, listTransactions, removeTransaction, summarize } from "./excelStore";
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-app.get("/api/transactions", async (_req, res) => res.json(await listTransactions()));
-
-app.post("/api/transactions", async (req, res) => {
-  const b = req.body;
-  if (!b.date || !b.type || !Number.isFinite(Number(b.amount)) || Number(b.amount) < 0) {
-    return res.status(400).json({ message: "Date, type and a valid amount are required." });
-  }
-  res.status(201).json(await addTransaction({ ...b, amount: Number(b.amount) }));
-});
-
-app.delete("/api/transactions/:id", async (req, res) => {
-  const ok = await removeTransaction(req.params.id);
-  res.status(ok ? 204 : 404).end();
-});
-
-app.get("/api/summary", async (req, res) =>
-  res.json(
-    summarize(
-      await listTransactions(),
-      typeof req.query.month === "string" ? req.query.month : undefined
-    )
-  )
-);
-
-app.get("/api/export", (_req, res) => res.download(file, "finance-data.xlsx"));
-
-const dist = path.resolve("dist");
-app.use(express.static(dist));
-app.use((_req, res) => res.sendFile(path.join(dist, "index.html")));
-
-app.listen(3001, () => console.log("Finance API running on http://localhost:3001"));
+import express from"express";import cors from"cors";import path from"node:path";import{add,ensureWorkbook,file,readAll,remove,updateTransaction}from"./excelStore";import type{FinanceData}from"./types";
+const app=express();app.use(cors());app.use(express.json());await ensureWorkbook();
+app.get("/api/data",async(_q,r)=>r.json(await readAll()));
+app.post("/api/:kind",async(q,r)=>{const k=q.params.kind as keyof FinanceData;if(!["transactions","budgets","goals","loans","accounts","recurring"].includes(k))return r.status(404).end();if(k==="transactions"&&(!q.body.date||!q.body.type||!Number.isFinite(Number(q.body.amount))))return r.status(400).json({message:"Date, type and amount are required."});r.status(201).json(await add(k,{...q.body,amount:q.body.amount===undefined?undefined:Number(q.body.amount)}))});
+app.put("/api/transactions/:id",async(q,r)=>{const x=await updateTransaction(q.params.id,q.body);x?r.json(x):r.status(404).end()});
+app.delete("/api/:kind/:id",async(q,r)=>{const k=q.params.kind as keyof FinanceData;if(!["transactions","budgets","goals","loans","accounts","recurring"].includes(k))return r.status(404).end();r.status(await remove(k,q.params.id)?204:404).end()});
+app.get("/api/export",(_q,r)=>r.download(file,"finance-data.xlsx"));const dist=path.resolve("dist");app.use(express.static(dist));app.use((_q,r)=>r.sendFile(path.join(dist,"index.html")));app.listen(3001,()=>console.log("FinanceFlow http://localhost:3001"));
