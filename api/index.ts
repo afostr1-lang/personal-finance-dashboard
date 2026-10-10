@@ -33,7 +33,18 @@ export default async function handler(req:any,res:any){
   res.setHeader("Cache-Control","no-store");
   const url=new URL(req.url,"https://finance.local"),parts=url.pathname.replace(/^\/api\/?/,"").split("/").filter(Boolean);
   if(parts[0]==="login"&&req.method==="POST"){
-    if(!safeEqual(String(req.body?.password||""),password))return res.status(401).json({message:"Incorrect password"});
+    const db=neon(process.env.DATABASE_URL);
+    await db.query("CREATE TABLE IF NOT EXISTS login_attempts (client_key TEXT PRIMARY KEY, attempts INTEGER NOT NULL DEFAULT 0, window_start TIMESTAMPTZ NOT NULL DEFAULT now(), locked_until TIMESTAMPTZ)");
+    const ip=String(req.headers["x-forwarded-for"]||req.socket?.remoteAddress||"unknown").split(",")[0].trim();
+    const clientKey=sign(ip,secret);
+    const checks=await db.query("SELECT locked_until FROM login_attempts WHERE client_key=$1",[clientKey]);
+    if(checks[0]?.locked_until&&new Date(checks[0].locked_until).getTime()>Date.now())return res.status(429).json({message:"Too many attempts. Try again in 15 minutes."});
+
+    if(!safeEqual(String(req.body?.password||""),password)){
+      await db.query("INSERT INTO login_attempts(client_key,attempts,window_start,locked_until) VALUES($1,1,now(),NULL) ON CONFLICT(client_key) DO UPDATE SET attempts=CASE WHEN login_attempts.window_start<now()-interval '15 minutes' THEN 1 ELSE login_attempts.attempts+1 END, window_start=CASE WHEN login_attempts.window_start<now()-interval '15 minutes' THEN now() ELSE login_attempts.window_start END, locked_until=CASE WHEN login_attempts.window_start>=now()-interval '15 minutes' AND login_attempts.attempts>=4 THEN now()+interval '15 minutes' ELSE NULL END",[clientKey]);
+      return res.status(401).json({message:"Incorrect password"});
+    }
+    await db.query("DELETE FROM login_attempts WHERE client_key=$1",[clientKey]);
     const expires=Date.now()+7*86400000,nonce=randomBytes(16).toString("hex"),value=expires+"."+nonce,token=value+"."+sign(value,secret);
     res.setHeader("Set-Cookie","ff_session="+token+"; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=604800");return res.status(200).json({ok:true});
   }
@@ -55,6 +66,11 @@ export default async function handler(req:any,res:any){
   }
   const kind=parts[0] as Kind;if(!kinds.includes(kind))return res.status(404).json({message:"Unknown endpoint"});
   if(req.method==="PATCH"&&parts[1]){const body=req.body||{},fields=cols[kind].filter(x=>Object.prototype.hasOwnProperty.call(body,x)||Object.prototype.hasOwnProperty.call(body,x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())));if(!fields.length)return res.status(400).json({message:"No changes provided"});const values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]);const updates=fields.map((x,i)=>x+"=$"+(i+1)).join(",");const rows=await sql.query("UPDATE "+kind+" SET "+updates+" WHERE id=$"+(fields.length+1)+" RETURNING *",[...values,parts[1]]);return rows.length?res.status(200).json(camel(rows[0])):res.status(404).json({message:"Record not found"});}
+  if(req.method==="POST"&&kind==="transactions"&&String(req.body?.notes||"").startsWith("Receipt reviewed:")){
+    const b=req.body||{};
+    const matches=await sql.query("SELECT id FROM transactions WHERE type='Expense' AND date=$1 AND amount=$2 AND lower(trim(description))=lower(trim($3)) LIMIT 1",[b.date,Number(b.amount),String(b.description||"")]);
+    if(matches.length)return res.status(409).json({message:"This receipt appears to have already been recorded."});
+  }
   if(req.method==="POST"){const fields=cols[kind],body=req.body||{},values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]??null);const qs=fields.map((_,i)=>"$"+(i+1)).join(",");const rows=await sql.query(`INSERT INTO ${kind} (${fields.join(",")}) VALUES (${qs}) RETURNING *`,values);return res.status(201).json(camel(rows[0]));}
   if(req.method==="DELETE"&&parts[1]){await sql.query(`DELETE FROM ${kind} WHERE id=$1`,[parts[1]]);return res.status(204).end();}
   return res.status(405).json({message:"Method not allowed"});
