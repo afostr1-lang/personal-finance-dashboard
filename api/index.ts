@@ -35,7 +35,7 @@ export default async function handler(req:any,res:any){
    const buf=await wb.xlsx.writeBuffer();res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");res.setHeader("Content-Disposition",'attachment; filename="finance-data.xlsx"');return res.status(200).send(Buffer.from(buf));
   }
   const kind=parts[0] as Kind;if(!kinds.includes(kind))return res.status(404).json({message:"Unknown endpoint"});
-  if(req.method==="POST"){const fields=cols[kind],body=req.body||{},values=fields.map(x=>body[camel({[x]:"x"})&&x]??body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??null);const qs=fields.map((_,i)=>"$"+(i+1)).join(",");const rows=await sql.query(`INSERT INTO ${kind} (${fields.join(",")}) VALUES (${qs}) RETURNING *`,values);return res.status(201).json(camel(rows[0]));}
+  if(req.method==="POST"){const fields=cols[kind],body=req.body||{},values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]??null);const qs=fields.map((_,i)=>"$"+(i+1)).join(",");const rows=await sql.query(`INSERT INTO ${kind} (${fields.join(",")}) VALUES (${qs}) RETURNING *`,values);return res.status(201).json(camel(rows[0]));}
   if(req.method==="DELETE"&&parts[1]){await sql.query(`DELETE FROM ${kind} WHERE id=$1`,[parts[1]]);return res.status(204).end();}
   return res.status(405).json({message:"Method not allowed"});
  }catch(e:any){console.error(e);return res.status(500).json({message:e?.message||"Server error"});}
