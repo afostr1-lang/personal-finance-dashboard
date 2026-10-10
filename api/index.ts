@@ -1,6 +1,9 @@
+import {createHmac,timingSafeEqual,randomBytes} from "node:crypto";
 import { neon } from "@neondatabase/serverless";
 import ExcelJS from "exceljs";
 
+const safeEqual=(a:string,b:string)=>{const x=Buffer.from(a),y=Buffer.from(b);return x.length===y.length&&timingSafeEqual(x,y)};
+const sign=(value:string,secret:string)=>createHmac("sha256",secret).update(value).digest("hex");
 const kinds = ["transactions","budgets","goals","loans","accounts","recurring"] as const;
 type Kind = typeof kinds[number];
 
@@ -25,8 +28,24 @@ async function all(sql:any){const out:any={};for(const k of kinds)out[k]=(await 
 export default async function handler(req:any,res:any){
  try{
   if(!process.env.DATABASE_URL)return res.status(500).json({message:"DATABASE_URL is not configured."});
-  const sql=neon(process.env.DATABASE_URL);await setup(sql);
+  const password=process.env.FINANCEFLOW_PASSWORD,secret=process.env.FINANCEFLOW_SESSION_SECRET;
+  if(!password||!secret||secret.length<32)return res.status(503).json({message:"Security setup required: configure FINANCEFLOW_PASSWORD and FINANCEFLOW_SESSION_SECRET (32+ characters) in Vercel."});
+  res.setHeader("Cache-Control","no-store");
   const url=new URL(req.url,"https://finance.local"),parts=url.pathname.replace(/^\/api\/?/,"").split("/").filter(Boolean);
+  if(parts[0]==="login"&&req.method==="POST"){
+    if(!safeEqual(String(req.body?.password||""),password))return res.status(401).json({message:"Incorrect password"});
+    const expires=Date.now()+7*86400000,nonce=randomBytes(16).toString("hex"),value=expires+"."+nonce,token=value+"."+sign(value,secret);
+    res.setHeader("Set-Cookie","ff_session="+token+"; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=604800");return res.status(200).json({ok:true});
+  }
+  if(parts[0]==="logout"&&req.method==="POST"){res.setHeader("Set-Cookie","ff_session=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0");return res.status(200).json({ok:true})}
+  const cookie=String(req.headers.cookie||"").split(";").map((x:string)=>x.trim()).find((x:string)=>x.startsWith("ff_session="))?.slice(11)||"";
+  const pieces=cookie.split("."),value=pieces.slice(0,2).join("."),valid=pieces.length===3&&Number(pieces[0])>Date.now()&&safeEqual(sign(value,secret),pieces[2]);
+  if(!valid)return res.status(401).json({message:"Authentication required"});
+  if(!["GET","HEAD"].includes(req.method)&&req.headers.origin){
+    const origin=new URL(req.headers.origin).host,host=String(req.headers.host||"");
+    if(origin!==host)return res.status(403).json({message:"Cross-origin request rejected"});
+  }
+  const sql=neon(process.env.DATABASE_URL);await setup(sql);
   if(req.method==="GET"&&parts[0]==="data")return res.status(200).json(await all(sql));
   if(req.method==="GET"&&parts[0]==="health")return res.status(200).json({ok:true,storage:"neon"});
   if(req.method==="GET"&&parts[0]==="export"){
@@ -35,6 +54,7 @@ export default async function handler(req:any,res:any){
    const buf=await wb.xlsx.writeBuffer();res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");res.setHeader("Content-Disposition",'attachment; filename="finance-data.xlsx"');return res.status(200).send(Buffer.from(buf));
   }
   const kind=parts[0] as Kind;if(!kinds.includes(kind))return res.status(404).json({message:"Unknown endpoint"});
+  if(req.method==="PATCH"&&parts[1]){const body=req.body||{},fields=cols[kind].filter(x=>Object.prototype.hasOwnProperty.call(body,x)||Object.prototype.hasOwnProperty.call(body,x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())));if(!fields.length)return res.status(400).json({message:"No changes provided"});const values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]);const updates=fields.map((x,i)=>x+"=$"+(i+1)).join(",");const rows=await sql.query("UPDATE "+kind+" SET "+updates+" WHERE id=$"+(fields.length+1)+" RETURNING *",[...values,parts[1]]);return rows.length?res.status(200).json(camel(rows[0])):res.status(404).json({message:"Record not found"});}
   if(req.method==="POST"){const fields=cols[kind],body=req.body||{},values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]??null);const qs=fields.map((_,i)=>"$"+(i+1)).join(",");const rows=await sql.query(`INSERT INTO ${kind} (${fields.join(",")}) VALUES (${qs}) RETURNING *`,values);return res.status(201).json(camel(rows[0]));}
   if(req.method==="DELETE"&&parts[1]){await sql.query(`DELETE FROM ${kind} WHERE id=$1`,[parts[1]]);return res.status(204).end();}
   return res.status(405).json({message:"Method not allowed"});
