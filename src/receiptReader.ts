@@ -18,7 +18,7 @@ export async function readReceipt(file:File):Promise<ReceiptDetails>{
  let text="";
  if(file.type==="application/pdf"||file.name.toLowerCase().endsWith(".pdf")){
   const pdfjs=await import("pdfjs-dist");
-  pdfjs.GlobalWorkerOptions.workerSrc=(await import("pdfjs-dist/build/pdf.worker.min.mjs?url")).default;
+  pdfjs.GlobalWorkerOptions.workerSrc=new URL("pdfjs-dist/build/pdf.worker.min.mjs",import.meta.url).toString();
   const pdf=await pdfjs.getDocument({data:new Uint8Array(await file.arrayBuffer())}).promise;
   if(pdf.numPages>5)throw Error("For now, upload a PDF with up to five pages.");
   for(let i=1;i<=pdf.numPages;i++){const page=await pdf.getPage(i);const content=await page.getTextContent();const pageText=content.items.map((x:any)=>x.str||"").join("\n");text+="\n"+pageText;
