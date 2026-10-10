@@ -4,7 +4,6 @@ const categories:[RegExp,string][]=[[/supermarket|grocery|grocer|fresh|market|fo
 function extract(text:string):ReceiptDetails{
  const lines=text.split(/\r?\n/).map(x=>x.trim()).filter(Boolean);
  const merchant=lines.find(x=>/[a-z]{3}/i.test(x)&&!/(receipt|invoice|tax invoice|date|cashier|telephone|phone|welcome|thank you)/i.test(x))?.slice(0,90);
- const moneyValue=(s:string)=>{const m=s.replace(/,/g,"").match(/(?:J\$|\$|JMD\s*)?\s*(\d{1,8}(?:\.\d{2})?)/i);return m?Number(m[1]):null};
  const totals=lines.filter(x=>/\b(grand\s*total|total\s*due|amount\s*due|balance\s*due|total\s*paid|total)\b/i.test(x)&&!/subtotal|sub total|tax total|items total|total items|change|discount/i.test(x));
  const candidates=totals.map(x=>{const matches=[...x.replace(/,/g,"").matchAll(/\d{1,8}(?:\.\d{2})?/g)];return matches.length?Number(matches[matches.length-1][0]):null}).filter((n):n is number=>n!==null&&n>0);
  const total=candidates.length?candidates[candidates.length-1]:null;
