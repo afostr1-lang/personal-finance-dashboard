@@ -22,8 +22,26 @@ const cols:Record<Kind,string[]>={
  recurring:["name","type","category","amount","frequency","next_date","account"]
 };
 const camel=(r:any)=>{const o:any={};for(const[k,v]of Object.entries(r))o[k.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]=v;return o};
-async function setup(sql:any){for(const k of kinds)await sql.query(tableSql[k])}
-async function all(sql:any){const out:any={};for(const k of kinds)out[k]=(await sql.query(`SELECT * FROM ${k} ORDER BY 1 DESC`)).map(camel);return out}
+async function setup(sql:any){
+ for(const k of kinds)await sql.query(tableSql[k]);
+ await sql.query("ALTER TABLE transactions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()");
+ await sql.query("CREATE TABLE IF NOT EXISTS account_tracking (account_id UUID PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE, enabled_at TIMESTAMPTZ NOT NULL DEFAULT now(), baseline DOUBLE PRECISION NOT NULL)");
+}
+async function all(sql:any){
+ const out:any={};
+ for(const k of kinds)out[k]=(await sql.query(`SELECT * FROM ${k} ORDER BY 1 DESC`)).map(camel);
+ const tracking=await sql.query("SELECT account_id, enabled_at, baseline FROM account_tracking");
+ for(const account of out.accounts){
+  const t=tracking.find((x:any)=>String(x.account_id)===String(account.id));
+  account.trackingEnabled=Boolean(t);
+  if(!t){account.effectiveBalance=Number(account.balance||0);continue;}
+  const entries=await sql.query("SELECT type,amount FROM transactions WHERE account=$1 AND created_at >= $2",[account.name,t.enabled_at]);
+  const delta=entries.reduce((sum:number,x:any)=>sum+((x.type==="Income")?Number(x.amount):(["Expense","Savings","Investment","Loan Payment"].includes(x.type)?-Number(x.amount):0)),0);
+  account.effectiveBalance=Number(t.baseline)+delta;
+  account.balanceDelta=delta;
+ }
+ return out;
+}
 
 export default async function handler(req:any,res:any){
  try{
@@ -57,6 +75,15 @@ export default async function handler(req:any,res:any){
     if(origin!==host)return res.status(403).json({message:"Cross-origin request rejected"});
   }
   const sql=neon(process.env.DATABASE_URL);await setup(sql);
+  if(parts[0]==="account-tracking"&&req.method==="POST"){
+    const id=String(req.body?.accountId||"");
+    const account=await sql.query("SELECT id,name,balance FROM accounts WHERE id=$1",[id]);
+    if(!account.length)return res.status(404).json({message:"Account not found"});
+    const existing=await sql.query("SELECT account_id FROM account_tracking WHERE account_id=$1",[id]);
+    if(existing.length)return res.status(409).json({message:"Automatic tracking is already enabled"});
+    await sql.query("INSERT INTO account_tracking(account_id,baseline) VALUES($1,$2)",[id,account[0].balance]);
+    return res.status(200).json({ok:true,message:"Future transactions will affect this account. Historical entries are excluded."});
+  }
   if(req.method==="GET"&&parts[0]==="data")return res.status(200).json(await all(sql));
   if(req.method==="GET"&&parts[0]==="health")return res.status(200).json({ok:true,storage:"neon"});
   if(req.method==="GET"&&parts[0]==="export"){
@@ -65,11 +92,18 @@ export default async function handler(req:any,res:any){
    const buf=await wb.xlsx.writeBuffer();res.setHeader("Content-Type","application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");res.setHeader("Content-Disposition",'attachment; filename="finance-data.xlsx"');return res.status(200).send(Buffer.from(buf));
   }
   const kind=parts[0] as Kind;if(!kinds.includes(kind))return res.status(404).json({message:"Unknown endpoint"});
-  if(req.method==="PATCH"&&parts[1]){const body=req.body||{},fields=cols[kind].filter(x=>Object.prototype.hasOwnProperty.call(body,x)||Object.prototype.hasOwnProperty.call(body,x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())));if(!fields.length)return res.status(400).json({message:"No changes provided"});const values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]);const updates=fields.map((x,i)=>x+"=$"+(i+1)).join(",");const rows=await sql.query("UPDATE "+kind+" SET "+updates+" WHERE id=$"+(fields.length+1)+" RETURNING *",[...values,parts[1]]);return rows.length?res.status(200).json(camel(rows[0])):res.status(404).json({message:"Record not found"});}
+  if(req.method==="PATCH"&&parts[1]){if(kind==="accounts"){const tracked=await sql.query("SELECT account_id FROM account_tracking WHERE account_id=$1",[parts[1]]);if(tracked.length&&("balance" in (req.body||{})||"name" in (req.body||{})))return res.status(409).json({message:"Tracked account balance and name cannot be edited directly. Disable tracking through a reconciliation workflow first."});}const body=req.body||{},fields=cols[kind].filter(x=>Object.prototype.hasOwnProperty.call(body,x)||Object.prototype.hasOwnProperty.call(body,x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())));if(!fields.length)return res.status(400).json({message:"No changes provided"});const values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]);const updates=fields.map((x,i)=>x+"=$"+(i+1)).join(",");const rows=await sql.query("UPDATE "+kind+" SET "+updates+" WHERE id=$"+(fields.length+1)+" RETURNING *",[...values,parts[1]]);return rows.length?res.status(200).json(camel(rows[0])):res.status(404).json({message:"Record not found"});}
   if(req.method==="POST"&&kind==="transactions"&&String(req.body?.notes||"").startsWith("Receipt reviewed:")){
     const b=req.body||{};
     const matches=await sql.query("SELECT id FROM transactions WHERE type='Expense' AND date=$1 AND amount=$2 AND lower(trim(description))=lower(trim($3)) LIMIT 1",[b.date,Number(b.amount),String(b.description||"")]);
     if(matches.length)return res.status(409).json({message:"This receipt appears to have already been recorded."});
+  }
+  if(req.method==="POST"&&kind==="transactions"){
+    const b=req.body||{};
+    if(b.account){
+      const tracked=await sql.query("SELECT a.id FROM account_tracking t JOIN accounts a ON a.id=t.account_id WHERE a.name=$1",[b.account]);
+      if(tracked.length>1)return res.status(409).json({message:"Ambiguous account name. Use unique account names."});
+    }
   }
   if(req.method==="POST"){const fields=cols[kind],body=req.body||{},values=fields.map(x=>body[x.replace(/_([a-z])/g,(_,c)=>c.toUpperCase())]??body[x]??null);const qs=fields.map((_,i)=>"$"+(i+1)).join(",");const rows=await sql.query(`INSERT INTO ${kind} (${fields.join(",")}) VALUES (${qs}) RETURNING *`,values);return res.status(201).json(camel(rows[0]));}
   if(req.method==="DELETE"&&parts[1]){await sql.query(`DELETE FROM ${kind} WHERE id=$1`,[parts[1]]);return res.status(204).end();}
